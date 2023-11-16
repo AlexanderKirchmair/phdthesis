@@ -1,0 +1,489 @@
+---
+title: "Transcriptomics"
+author: "Alexander Kirchmair"
+params:
+  figures:    ./figures
+  data:   ./data
+  data_paper:   ../kirchmair_2023/data
+  data_public: /data/datasets
+---
+
+```{r setup, include=FALSE}
+library(survival)
+library(survminer)
+library(dplyr)
+library(datamisc)
+library(patchwork)
+library(GEOquery)
+library(Seurat)
+
+source("lib/functions.R")
+```
+
+
+## Prepare metabolic markers
+
+Metabolic checkpoints
+```{r}
+checkpoints <- list(
+  "pro" = c("PYCR3", "PRODH", "PRODH2"),
+  "glycolysis" = c("ENO1", "ENO2", "LDHA"),
+  "succ" = c("SDHA", "SDHB", "SDHC", "SDHD"),
+  "ita" = c("ACOD1", "AUH", "CLYBL"),
+  "transport" = c("SLC7A5", "SLC1A5", "SLC38A5"),
+  "quiescence" = c("TXNIP", "KLF2", "BTG1", "TCF7"),
+  "mito" = c("CYC1", "PMPCB", "COX5B")
+)
+
+df <- stack(checkpoints)
+colnames(df) <- c("gene","pathway")
+```
+
+
+Metabolic gene sets
+```{r}
+genesets <- read.delim(fp(params$data_paper, "tables", "genesets.tsv.gz")) |> convertGeneSets()
+
+mgs <- list(
+  "NADH malate-aspartate shuttle" = c("MDH1", "MDH2", "GOT1", "GOT2", "SLC25A11", "SLC25A12", "SLC25A13"),
+  "NADH citrate-malate shuttle" = c("MDH1", "MDH2", "SLC25A1", "ACLY"),
+  "NADH glycerol-3-p shuttle"= c("GPD1", "GPD2"),
+  "NADH proline cycle" = c("PYCR3", "PRODH", "PRODH2", "ALDH18A1", "OAT")
+)
+
+to_add <- c("HALLMARK glycolysis",
+            "HALLMARK oxidative phosphorylation",
+            "GO L-amino acid transmembrane transporter activity",
+            "MitoCarta oxphos subunits",
+            "MitoCarta mitophagy",
+            "MitoCarta tca cycle",
+            "MetabolicAtlas fatty_acid_biosynthesis",
+            "MetabolicAtlas fatty_acid_oxidation",
+            "MetabolicAtlas glycolysis_gluconeogenesis",
+            "MetabolicAtlas pentose_phosphate_pathway")
+mgs <- c(mgs, genesets[to_add])
+mgs <- genesets[grep("HALLMARK|KEGG|MitoCarta|MetabolicAtlas", names(genesets))]
+mgs <- mgs[!grepl("cancer", names(mgs))]
+```
+
+
+## Integration of memory and exhaustion samples
+
+```{r}
+RNAmem <- readRDS(fp(params$data_paper, "RNAmem.rds"))
+RNAexh <- readRDS(fp(params$data_paper, "RNAexh.rds"))
+
+RNA <- list()
+RNA$counts <- cjoin(RNAmem$counts, RNAexh$counts)
+RNA$design <- full_join(mutate(RNAmem$design, Celltype = as.character(Celltype), Donor = as.character(Donor)),
+                        mutate(RNAexh$design, Exp = NULL, Celltype = as.character(Celltype), Donor = as.character(as.numeric(Donor)+3)))
+rownames(RNA$design) <- c(rownames(RNAmem$design), rownames(RNAexh$design))
+
+RNA$contrasts <- list(TSCMvsTN = c("Celltype", "TSCM", "TN"),
+                      TCMvsTN = c("Celltype", "TCM", "TN"),
+                      TEMvsTN = c("Celltype", "TEM", "TN"),
+                      TEFFvsTN = c("Celltype", "TEFF", "TN"),
+                      TEXvsTN = c("Celltype", "TEX", "TN"))
+
+RNA$deseq2 <- runDESeq2(as.matrix(RNA$counts)[,rownames(RNA$design)], design = RNA$design, formula = ~ Celltype, contrasts = RNA$contrasts)
+RNA$lmarkers <- limmamarkers(log2(RNA$deseq2$normcounts+1), RNA$design, group = "Celltype", formula = ~ group, log2FC > 1 & padj < 0.05)
+RNA$markers <- getmarkers(as.matrix(RNA$counts)[,rownames(RNA$design)], RNA$design, group = "Celltype", formula = ~ group, log2FC > 1 & padj < 0.05)
+
+RNA$norm <- log2(RNA$deseq2$normcounts + 1) |> summarise_cols(coldata = RNA$design, by = Celltype, FUN = rowMeans)
+
+RNA$design$batch <- "A"
+RNA$design$batch[RNA$design$Celltype %in% c("TEX", "TEFF")] <- "B"
+tmp <- RNA$design
+tmp$Celltype[tmp$batch == "A"] <- "TEM"
+RNA$corr <- log2(RNA$deseq2$normcounts + 1) |> limma::removeBatchEffect(batch = RNA$design$batch, design = model.matrix(~ 0 + Celltype, data = tmp[,c("Celltype"),drop=F]))
+RNA$corrmean <- log2(RNA$deseq2$normcounts + 1) |> summarise_cols(coldata = RNA$design, by = Celltype, FUN = rowMeans)
+
+RNA$corrmarkers <- limmamarkers(RNA$corr, RNA$design, group = "Celltype", formula = ~ group, log2FC > 1 & padj < 0.05)
+
+RNA$formula <- ~ Celltype + Donor
+RNA$contrasts <- list(TSCMvsTN = c("Celltype", "TSCM", "TN"),
+                      TCMvsTSCM = c("Celltype", "TCM", "TSCM"),
+                      TEMvsTCM = c("Celltype", "TEM", "TCM"),
+                      TEXvsTEFF = c("Celltype", "TEX", "TEFF"))
+```
+
+
+## Public datasets
+
+Feucht2019: [GSE121226](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE121226)
+Jansen2019: [GSE140430](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE140430)
+Galletti2020: [GSE147398](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE147398)
+Giles2022: [GSE179609](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE179609)
+Chen2022: [GSE212697](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE212697)
+
+Additionally added data from Chen2022 et al., 2022
+```{r}
+Chen2022 <- list()
+geo <- getGEO("GSE212697", destdir = "~/myScratch/GEO")[[1]]
+geofiles <- getGEOSuppFiles("GSE212697", baseDir = "~/myScratch/GEO")
+
+Chen2022$design <- pData(geo) |> select(title, description, 'treatment:ch1')
+Chen2022$design <- Chen2022$design |> rename(celltype = description, day = title, condition = 'treatment:ch1')
+Chen2022$design$celltype <- Chen2022$design$celltype |> sub(pattern = "_rep|_donor", replacement = "")
+Chen2022$design$day <- Chen2022$design$day |> sub(pattern = ",.*", replacement = "")
+rownames(Chen2022$design) <- Chen2022$design$celltype
+
+Chen2022$design$celltype[grepl("Tex", Chen2022$design$celltype)] <- "TEX"
+Chen2022$design$celltype[grepl("Teff", Chen2022$design$celltype)] <- "TEFF"
+Chen2022$design$condition[grepl("treatment", Chen2022$design$condition)] <- "IFNI"
+Chen2022$design$condition[Chen2022$design$condition == "Ctrl"] <- "ctrl"
+
+x1 <- read.delim(rownames(geofiles)[1])
+x2 <- read.delim(rownames(geofiles)[2])
+x1uni <- datamisc::collapse(select(x1, -symbol), x1$symbol, average_by = sum)
+x2uni <- datamisc::collapse(select(x2, -gene_name, -gene_id, -gene_length), x2$gene_name, average_by = sum)
+
+Chen2022$counts <- cjoin(x1uni, x2uni)
+colnames(Chen2022$counts) <- colnames(Chen2022$counts) |>
+  gsub(pattern = ".rep|.donor", replacement = "") |>
+  gsub(pattern = ".", replacement = "", fixed = TRUE) |>
+  gsub(pattern = "IFNI", replacement = "_IFN")
+
+Chen2022$counts <- Chen2022$counts[,rownames(Chen2022$design)]
+
+saveRDS(Chen2022, fp(params$data, "Chen2022.rds"))
+
+```
+
+
+Datasets used in the main manuscript
+```{r}
+Feucht2019 <- readRDS(fp(params$data_paper, "Feucht2019.rds"))
+Jansen2019 <- readRDS(fp(params$data_paper, "Jansen2019.rds"))
+Galletti2020a <- readRDS(fp(params$data_paper, "Galletti2020a.rds"))
+Galletti2020b <- readRDS(fp(params$data_paper, "Galletti2020b.rds"))
+Giles2022 <- readRDS(fp(params$data_paper, "Giles2022.rds"))
+
+Chen2022 <- readRDS(fp(params$data, "Chen2022.rds"))
+
+cols <- c("celltype", "group", "dataset", "origin")
+df <- rbind(
+  Chen2022$design |> subset(condition == "ctrl") |> mutate(group = "Chen2022", dataset = "Chen2022", origin = "PBMC") |> select(cols),
+  Feucht2019$design |> subset(celltype != "CART") |> mutate(group = dataset, celltype = paste0(celltype, "_", condition), origin = "PBMC") |> select(cols),
+  Jansen2019$design |> mutate(group = paste0(origin, "_", dataset)) |> select(cols),
+  Galletti2020a$design |> mutate(group = dataset) |> select(cols),
+  Galletti2020b$design |> mutate(group = paste0(condition, "_", dataset)) |> select(cols),
+  Giles2022$design |> mutate(group = dataset) |> select(cols)
+)
+
+counts <- datamisc::cjoin(
+  Chen2022$counts[,rownames(Chen2022$design |> subset(condition == "ctrl"))],
+  Feucht2019$txi$counts,
+  Jansen2019$txi$counts,
+  Galletti2020a$txi$counts,
+  Galletti2020b$txi$counts,
+  Giles2022$txi$counts
+)
+
+counts <- round(counts) |> as.matrix()
+mode(counts) <- "integer"
+ids <- intersect(colnames(counts), rownames(df))
+counts <- counts[,ids]
+df <- df[ids,]
+rownames(df) <- paste0(df$celltype, "_", df$group) |> dedupl(sep = "_")
+colnames(counts) <- rownames(df)
+
+df$celltype[df$celltype == "TSCMr3"] <- "TSCM"
+df$celltype[df$celltype == "CD8naive"] <- "TN"
+df$celltype[df$celltype == "TN_control"] <- "TN"
+df$celltype[df$celltype == "TSCM_control"] <- "TSCM"
+df$celltype[df$celltype == "TEFF_control"] <- "TEFF"
+df$celltype[df$celltype == "TEM1"] <- "TEM"
+df$celltype[df$celltype == "TEM2"] <- "TEM"
+
+df <- subset(df, !celltype %in% c("CART_1928z", "CART_XX3", "CART_1XX", "CD8", "TMEM"))
+public_new <- runDESeq2(counts, design = df, formula = ~ celltype + group, ncores = 1)
+public_new$markers <- limmamarkers(log2(public_new$normcounts+1), dplyr::rename(public_new$design, batch = group), "celltype", formula = ~ group + batch, log2FC > 1.5 & padj < 0.05)
+public_new$norm <- log2(public_new$normcounts + 1) |> summarise_cols(coldata = public_new$design, by = celltype, FUN = rowMeans)
+public_new$corr <- log2(public_new$normcounts + 1) |> limma::removeBatchEffect(batch = public_new$design$group)
+public_new$corrnorm <- public_new$corr |> summarise_cols(coldata = public_new$design, by = celltype, FUN = rowMeans)
+
+public_new$m <- rowMeans(public_new$norm)
+public_new$norm <- public_new$norm[order(public_new$m, decreasing = TRUE),]
+colnames(public_new$norm) <- paste0(colnames(public_new$norm), " (public)")
+
+saveRDS(public_new, fp(params$data, "human_public_datasets_exh.rds"))
+```
+
+
+Comparison to public bulk RNA sequencing data
+```{r}
+if (!exists("public_new")) public_new <- readRDS(fp(params$data, "human_public_datasets_exh.rds"))
+
+heatpal <- circlize::colorRamp2(c(-2,0,2), c("#000fe3","grey98","#ffc800"))
+RNA$topmarkers <- lapply(RNA$markers, function(x){ x[1:min(length(x),200)] })
+public_new$gsva_markers <- runGSVA(public_new$norm[1:10000,], genesets = RNA$topmarkers)
+colnames(public_new$gsva_markers) <- colnames(public_new$norm)
+public_new$gsva_markers |> cxheatmap(title = "z-NES", scale = "row", heatpal = heatpal) |>
+  saveplot(file = fp(params$figures, "public_comparison_new"), width = 2600, height = 2000)
+```
+
+
+Metabolic checkpoints expression
+```{r}
+df2 <- subset(df, gene %in% rownames(public_new$norm))
+df2$max_expr <- matrixStats::rowMaxs(as.matrix(public_new$norm[df2$gene,]))
+heatpal <- circlize::colorRamp2(c(-2,0,2), c("#000fe3","grey98","#ffc800"))
+expr_scale <- circlize::colorRamp2(breaks = c(c(0, max(df2$max_expr))), colors = c("#eeeeee","#63003a"))
+public_new$norm[df2$gene,] |>
+  cheatmap(scale = "row", heatpal = heatpal, colors = list(max_expr = expr_scale),
+           row_split = (df2$pathway),
+           rowdf = col2rownames(df2, gene)) |>
+    saveplot(file = fp(params$figures, "public_checkpoints"), width = 2600, height = 2600)
+
+df2 <- subset(df, gene %in% rownames(RNA$corrmean))
+df2$max_expr <- matrixStats::rowMaxs(as.matrix(RNA$corrmean[df2$gene,]))
+RNA$corrmean[df2$gene,] |>
+  cheatmap(scale = "row", heatpal = heatpal, colors = list(max_expr = expr_scale),
+           row_split = (df2$pathway),
+           rowdf = col2rownames(df2, gene)) |>
+    saveplot(file = fp(params$figures, "RNA_checkpoints"), width = 2600, height = 2600)
+
+heatpal <- circlize::colorRamp2(c(-3,0,3), c("#000fe3","grey98","#ffc800"))
+df2 <- subset(df, gene %in% rownames(public_new$normcounts))
+log2(public_new$normcounts + 1)[df2$gene,] |> t() |>
+  cheatmap(scale = "col", heatpal = heatpal, col_split = (df2$pathway),rowcex = 0.3, row_split = 10,
+           rowdf = public_new$design[,c("celltype", "origin", "dataset")], coldf = col2rownames(df2, gene)) |>
+    saveplot(file = fp(params$figures, "figures/public_checkpoints_all"), width = 2600, height = 4000)
+```
+
+
+GSVA with metabolic gene sets
+```{r}
+public_new$gsva_mgs <- runGSVA(public_new$norm[1:10000,], mgs)
+colnames(public_new$gsva_mgs) <- colnames(public_new$norm)
+
+RNA$gsva_mgs <- runGSVA(RNA$corrmean, mgs)
+
+heatpal <- circlize::colorRamp2(c(-2,0,2), c("#000fe3","grey98","#ffc800"))
+
+topvar <- apply(RNA$gsva_mgs, 1, var) |> sort(decreasing = TRUE)
+RNA$gsva_mgs[names(topvar)[1:30],] |> 
+  cxheatmap(scale = "row", rownames_width = 10, maxchar = Inf, heatpal = heatpal) |>
+    saveplot(file = fp(params$figures, "RNA_gsva"), width = 3000, height = 2000)
+
+topvar <- apply(public_new$gsva_mgs, 1, var) |> sort(decreasing = TRUE)
+public_new$gsva_mgs[names(topvar)[1:30],] |> 
+  cxheatmap(scale = "row", rownames_width = 10, maxchar = Inf, heatpal = heatpal) |>
+    saveplot(file = fp(params$figures, "public_gsva"), width = 3200, height = 2000)
+```
+
+
+Mitochondrial abundance prediction
+```{r}
+mitomodel <- readRDS(fp(params$data_paper, "mitomodel.rds"))
+
+public_new$mito <- predict(mitomodel$linmod, newdata = data.frame(t(log2(public_new$normcounts+1))))
+size <- 25
+mdf <- data.frame(public_new$design, Mito = public_new$mito[rownames(public_new$design)]) |>
+  mutate(Celltype = factor(celltype, ordered = TRUE, levels = c("TN","TSCM", "TPEX","TCM","TEM", "TEMRA", "TEFF", "TEX")))
+
+gg <- ggplot(mdf, aes(x = Celltype, y = Mito)) +
+  theme_gray(base_size = size) + theme(axis.text = element_text(colour = "black"), plot.tag = element_text(size = size, face = "bold")) +
+  geom_point(size = 4) + 
+  geom_boxplot(fill = NA) +
+  xlab("") +
+  ylab("rel. mito. abundance") + ylim(c(0,900)) +
+  ggpubr::stat_compare_means(size = size/ggplot2::.pt, method = "t.test", paired = TRUE)
+gg |> saveplot(file = fp(params$figures, "public_mito"), width = 3200, height = 1800)
+```
+
+
+Summary of public datasets
+```{r}
+dataset_table <- public_new$design |> select(celltype, dataset, origin) |> group_by(celltype, dataset, origin) |> summarise(samples = n())
+dataset_table |> arrange(dataset, desc(samples), celltype) |> openxlsx::write.xlsx(file = "dataset_table.xlsx")
+```
+
+
+
+## T Cell Map
+
+Clinical annotations are available for each patient at https://static-content.springer.com/esm/art%3A10.1038%2Fs41591-023-02371-y/MediaObjects/41591_2023_2371_MOESM3_ESM.xlsx,
+but patient IDs are not available
+```{r}
+if (!file.exists(fp(params$data, "CD8_Tcellmap.rds"))){
+  download.file("https://singlecell.mdanderson.org/TCM/download/CD8",
+                fp(params$data, "CD8_Tcellmap.rds"), method = "wget")
+}
+download.file("https://static-content.springer.com/esm/art%3A10.1038%2Fs41591-023-02371-y/MediaObjects/41591_2023_2371_MOESM3_ESM.xlsx",
+              fp(params$data, "TCM_annotation.xlsx"))
+```
+
+
+```{r}
+tcellmap <- readRDS(fp(params$data, "CD8_Tcellmap.rds"))
+
+tcellmap$group <- paste0(tcellmap$cell.type, "&", tcellmap$TissueType, "#", tcellmap$CancerType)
+Idents(tcellmap) <- tcellmap$cell.type
+tcellmap <- NormalizeData(tcellmap)
+
+tcellmap$group2 <- paste0(tcellmap$cell.type, "&", tcellmap$CancerType)
+tcellmap$group2 <- sub("CD8_","",tcellmap$group2)
+avg <- AverageExpression(tcellmap, group.by = "group2")
+avg$max <- rowMeans(avg$RNA)
+top <- sort(avg$max, decreasing = TRUE)
+
+cdf <- data.frame(row.names = colnames(avg$RNA))
+cdf$celltype = sub("&.*","",rownames(cdf))
+cdf$cancer = sub(".*&","",rownames(cdf))
+
+heatpal <- circlize::colorRamp2(c(-3,0,3), c("#000fe3","grey98","#ffc800"))
+df2 <- subset(df, gene %in% names(top)[1:20000])
+log2(avg$RNA[df$gene,]+1) |>
+  cxheatmap(scale = "row", heatpal = heatpal, coldf = cdf, show_column_names=F,  cluster_cols = F,
+            column_split = cdf$celltype, row_split = df$pathway, rowdf = col2rownames(df, gene), cluster_rows = FALSE) |>
+  saveplot(file = fp(params$figures, "tcm_checkpoints"), width = 8000, height = 4000)
+
+avg <- AverageExpression(tcellmap, group.by = "cell.type")
+avg$max <- rowMeans(avg$RNA)
+top <- sort(avg$max, decreasing = TRUE)
+heatpal <- circlize::colorRamp2(c(-2,0,2), c("#000fe3","grey98","#ffc800"))
+df2 <- subset(df, gene %in% names(top)[1:20000])
+rdf <- col2rownames(df, gene)
+rdf$max_expr <- log2(rowMaxs(avg$RNA[rownames(rdf),])+1)
+expr_scale <- circlize::colorRamp2(breaks = c(c(0, max(rdf$max_expr))), colors = c("#eeeeee","#63003a"))
+log2(avg$RNA[rownames(rdf),]+1) |>
+  cheatmap(scale = "row", heatpal = heatpal,  cluster_cols = TRUE, colors = list(max_expr = expr_scale),
+            row_split = df$pathway, rowdf = rdf, cluster_rows = T) |>
+  saveplot(file = fp(params$figures, "tcm_checkpoints_ct"), width = 3000, height = 3000)
+
+```
+
+
+
+## Sade-Feldman et al., 2018
+
+```{r}
+SadeFeldman2018 <- list()
+
+SadeFeldman2018 <- getGEOdata("GSE120575")
+SadeFeldman2018$tpm <- read.delim(SadeFeldman2018$suppfiles[1], skip = 2, header = FALSE, row.names = 1)
+colnames(SadeFeldman2018$tpm) <- colnames(read.delim(SadeFeldman2018$suppfiles[1], nrows = 5))
+
+SadeFeldman2018$meta <- fp(params$data_public, "SadeFeldman_2018/processed/GSE120575_patient_ID_single_cells.cleaned.txt") |> read.delim()
+SadeFeldman2018$meta$title <- gsub("-", ".", SadeFeldman2018$meta$title, fixed = TRUE)
+SadeFeldman2018$meta$time_patient <- SadeFeldman2018$meta$characteristics..patinet.ID..Pre.baseline..Post..on.treatment.
+SadeFeldman2018$meta$patient <- gsub(".*_", "", SadeFeldman2018$meta$time_patient)
+SadeFeldman2018$meta$time <- gsub("_.*", "", SadeFeldman2018$meta$time_patient)
+SadeFeldman2018$meta$response <- SadeFeldman2018$meta$characteristics..response
+SadeFeldman2018$meta$therapy <- SadeFeldman2018$meta$characteristics..therapy
+SadeFeldman2018$meta$patient_trt <- paste0(SadeFeldman2018$meta$patient, "_", SadeFeldman2018$meta$time)
+SadeFeldman2018$tpm <- SadeFeldman2018$tpm[,SadeFeldman2018$meta$title]
+```
+
+
+Metadata from SI
+```{r}
+# Cluster annotation
+ann <- openxlsx::read.xlsx(fp(params$data, "SadeFeldman2018_annotation.xlsx"), sheet = 5) |> col2rownames(Cell.Name)
+SadeFeldman2018$meta$cluster <- ann[SadeFeldman2018$meta$title,]
+ann <- openxlsx::read.xlsx(fp(params$data, "SadeFeldman2018_CD8annotation.xlsx"), sheet = 3) |> col2rownames(Cell.Name)
+SadeFeldman2018$meta$cd8cluster <- ann[SadeFeldman2018$meta$title,]
+SadeFeldman2018$meta$CD8 <- !is.na(SadeFeldman2018$meta$cd8cluster)
+
+# Survival data
+clin <- openxlsx::read.xlsx(fp(params$data, "SadeFeldman2018_annotation.xlsx"), sheet = 2, startRow = 2)
+clin$time <- clin$`Overall.survival.(days)`
+clin$status <- clin$`Status.(Alive=0;.Dead=1)`
+clin$response <- clin$`Clinical.response.(RECIST;.R=CR,.PR;.NR=SD,.PD)`
+clin$response_re <- (clin$response %in% c("R")) |> ifelse("R", "NR")
+clin$therapy <- clin$Therapy
+clin$therapy[grep("CTLA4 (baseline)", clin$Therapy, fixed = TRUE)] <- "CTLA4(pre)+PD1"
+rownames(clin) <- clin$Patient.ID
+```
+
+
+Checkpoint expression plot
+```{r}
+cd8_only <- subset(SadeFeldman2018$meta, CD8)
+SadeFeldman2018$means <- summarise_cols(SadeFeldman2018$tpm[,cd8_only$title], by = cd8_only$time_patient, FUN = rowMeans)
+coldf <- cd8_only |> dplyr::select(time_patient, time, response, therapy) |> unique()
+rownames(coldf) <- coldf$time_patient
+
+subdf <- subset(df, gene %in% rownames(x[rowSums(x, na.rm = TRUE) > 0,]))
+rdf <- subdf
+heatpal <- circlize::colorRamp2(c(-3,0,3), c("#000fe3","grey98","#ffc800"))
+
+coldf$response_treat <- paste0(coldf$response, " - ", coldf$time)
+x <-  SadeFeldman2018$means[subdf$gene, coldf$time_patient] |> logtrans()
+expr_scale <- circlize::colorRamp2(breaks = c(c(0, max(x))), colors = c("#eeeeee","#63003a"))
+rdf$max_expr <- matrixStats::rowMaxs(as.matrix(x))
+hmall <- x |> cheatmap(coldf = dplyr::select(coldf, -time_patient, -time, -response, -response_treat),  row_split = (rdf$pathway),
+                       rowdf = col2rownames(rdf, gene),  legend_params = list(direction = "vertical", ncol = 1),
+                     colors = list(max_expr = expr_scale), heatpal = heatpal, col_split = coldf$response_treat, scale = "row")
+hmall |> saveplot(fp(params$figures, "sade_feldman_comb"), width = 4000, height = 3200)
+```
+
+
+Survival analysis
+```{r}
+cd8_only <- subset(SadeFeldman2018$meta, CD8)
+cd8_only_pre <- cd8_only |> subset(time == "Pre")
+cd8_only_post <- cd8_only |> subset(time == "Post")
+ptmeans_pre <- summarise_cols(SadeFeldman2018$tpm[,cd8_only_pre$title], by = cd8_only_pre$patient, FUN = rowMeans)
+ptmeans_post <- summarise_cols(SadeFeldman2018$tpm[,cd8_only_post$title], by = cd8_only_post$patient, FUN = rowMeans)
+
+strata_pre <- data.frame(t(ptmeans_pre[intersect(df$gene, rownames(ptmeans_pre)), ]))
+strata_pre <- strata_pre[,colVars(as.matrix(strata_pre)) > 0 & colMeans(strata_pre > 0) > 0.25] |> stratify()
+rownames(strata_pre) <- gsub("_.*", "", rownames(strata_pre))
+strata_post <- data.frame(t(ptmeans_post[intersect(df$gene, rownames(ptmeans_post)), ]))
+strata_post <- strata_post[,colVars(as.matrix(strata_post)) > 0 & colMeans(strata_post > 0) > 0.25] |> stratify()
+rownames(strata_post) <- gsub("_.*", "", rownames(strata_post))
+
+ids <- intersect(rownames(clin), rownames(strata_post))
+strata_post <- strata_post[ids,]
+ids <- intersect(rownames(clin), rownames(strata_pre))
+strata_pre <- strata_pre[ids,]
+clin <- clin[ids,]
+
+ggpre <- names(strata_pre) %L>% select(time, status, .data = cjoin(clin, strata_pre)) %L>% KM(.) %L>% datamisc:::ggplotSurv(., xlabel = "days")
+ggpost <- names(strata_post) %L>% select(time, status, .data = cjoin(clin, strata_post)) %L>% KM(.) %L>% datamisc:::ggplotSurv(., xlabel = "days")
+
+lapply(ggpre, function(gg) gg  + theme(plot.margin = margin(10,15,10,15))) |> wrap_plots(ncol = 5, guides = "collect") |>
+  saveplot(fp(params$figures, "sade_feldman_survival_pre"), width = 7000, height = 5000)
+lapply(ggpost, function(gg) gg  + theme(plot.margin = margin(10,15,10,15))) |> wrap_plots(ncol = 5, guides = "collect") |>
+  saveplot(fp(params$figures, "sade_feldman_survival_post"), width = 7000, height = 5000)
+```
+
+
+Responders vs. Non-responders
+```{r}
+
+genes <- intersect(subdf$gene, colnames(strata_pre))
+tmp <- SadeFeldman2018$meta[colnames(SadeFeldman2018$tpm),] |> subset(time = "pre")
+
+res <- runTEST(logtrans(SadeFeldman2018$tpm[genes,tmp$title]), design = tmp,
+               contrasts = list(R = c("response","Responder","Non-responder")))
+tmp <- cjoin(clin, data.frame(t(ptmeans_pre[intersect(genes, rownames(ptmeans_pre)), ])))
+ggexpr_pre <- genes %L>% function(gene){
+  scp <- paste0("(", datamisc::pval_format(scientific = TRUE, add = "", res$padj[gene,]), ")") |> sub(pattern = "= ", replacement = "")
+  ggstat(tmp, aes_string(x = "response_re", y = gene, color = "therapy"), comparisons = list(c("R","NR")), add_labels = scp) +
+    theme_basic() + xlab("") +
+    scale_color_manual(values = c("PD1" = "darkred", "CTLA4+PD1" = "darkblue", "CTLA4(pre)+PD1" = "blue"))
+}
+wrap_plots(ggexpr_pre, ncol = 4, guides = "collect") |>
+  saveplot(file = fp(params$figures, "sade_feldman_expr_pre"), width = 5000, height = 5000)
+
+genes <- intersect(subdf$gene, colnames(strata_post))
+tmp <- SadeFeldman2018$meta[colnames(SadeFeldman2018$tpm),] |> subset(time = "post")
+res <- runTEST(logtrans(SadeFeldman2018$tpm[genes,tmp$title]), design = tmp,
+               contrasts = list(R = c("response","Responder","Non-responder")))
+tmp <- cjoin(clin, data.frame(t(ptmeans_post[intersect(genes, rownames(ptmeans_post)), ])))
+ggexpr_post <- genes %L>% function(gene){
+  scp <- paste0("(", datamisc::pval_format(scientific = TRUE, add = "", res$padj[gene,]), ")") |> sub(pattern = "= ", replacement = "")
+  ggstat(tmp, aes_string(x = "response_re", y = gene, color = "therapy"), comparisons = list(c("R","NR")), add_labels = scp) +
+    theme_basic() + xlab("") +
+    scale_color_manual(values = c("PD1" = "darkred", "CTLA4+PD1" = "darkblue", "CTLA4(pre)+PD1" = "blue"))
+}
+wrap_plots(ggexpr_post, ncol = 4, guides = "collect") |>
+  saveplot(file = fp(params$figures, "sade_feldman_expr_post"), width = 5000, height = 5000)
+
+```
+
+

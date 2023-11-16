@@ -1,0 +1,243 @@
+---
+title: "Metabolomics"
+author: "Alexander Kirchmair"
+params:
+  figures:    ./figures
+  data:    ../kirchmair_2023/data
+---
+
+```{r setup, include=FALSE}
+library(datamisc)
+library(c13ms)
+library(dplyr)
+source("lib/functions.R")
+```
+
+
+```{r}
+C13mem <- readRDS(fp(params$data, "C13mem.rds"))
+```
+
+
+```{r}
+full_width = 2100*2
+full_height = 2970*2
+
+panel_title_size <- 16
+axis_title_size <- 14
+axis_lab_size <- 12
+lab_size <- 14
+nlabels <- 20
+
+lwd = 0.5
+point_size = 3
+max_overlaps = Inf
+r <- 100
+a <- 1
+b <- 0.45
+s <- 50
+
+theme_fig <- theme(text = element_text(),
+                   plot.margin = margin(l = 10, r = 10, t = 10, b = 5),
+                   axis.title.x = element_text(size = 18, face = "plain"),
+                   axis.title.y = element_text(size = 18, face = "plain"),
+                   plot.tag = element_text(size = 18, face = "bold"))
+
+```
+
+
+LOQ plot
+```{r}
+loqdata <- assay(C13mem, "loq", type = "qc")
+loqdata %>% cxheatmap(rowdf = isoData(C13mem)[,c("metabolite", "label")],
+                      rowcex = 0.4, fontsize = 5, border = TRUE, column_split = C13mem$Sampletype,
+                      cluster_cols = FALSE,
+                      colors = colors,
+                      title = "LOQ",
+                      heatpal = circlize::colorRamp2(breaks = c(-3,0,0.01,1,30), colors = c("red4", "orangered3","dodgerblue", "white", "limegreen")),
+                      cluster_rows = FALSE) %>%
+            saveplot(fp(params$figures, "LOQ_differentiation"), width = 1500, height = 8000)
+
+```
+
+
+PCA plots
+```{r}
+colors$Celltype <- colors$celltype
+
+gg <- list(
+  ggpca(assay(C13mem_cells, "norm", type = "met"), colData(C13mem_cells), aes(color = Celltype, shape = Donor), colors = colors, na = "omit") + ggtitle("met. abundance"),
+  ggpca(assay(C13mem_cells, "frac", type = "met"), colData(C13mem_cells), aes(color = Celltype, shape = Donor), colors = colors, na = "omit") + ggtitle("frac. enrich."),
+  ggpca(assay(C13mem_cells, "clean", type = "iso"), colData(C13mem_cells), aes(color = Celltype, shape = Donor), colors = colors, na = "omit") + ggtitle("iso. abundance"),
+  ggpca(assay(C13mem_cells, "mid_clean", type = "iso"), colData(C13mem_cells), aes(color = Celltype, shape = Donor), colors = colors, na = "omit") + ggtitle("MID")
+)
+
+Fig <- (wrap_plots(gg, guides = "collect", tag_level = "new", ncol = 2) +
+            plot_annotation(tag_levels = 'A',  theme = theme(plot.tag = element_text(size = 8), title = element_text(size = 8, hjust = 0.5)))) & theme_fig
+Fig |> saveplot(fp(params$figures, "PCA"), dev = "png", width =  4000, height =  3000)
+
+```
+
+
+Heatmaps
+```{r}
+colData(C13mem_cells)$Name <- paste0(colData(C13mem_cells)$Celltype, colData(C13mem_cells)$Donor)
+
+heatpal <- circlize::colorRamp2(c(-2.5, 0, 2.5), c("#001aab", "grey99", "#ffd900"))
+mets <- assay(C13mem_cells, "norm", type = "met")
+mets <- mets[rowSums(!is.na(mets)) > 2 & rownames(mets) != "myr_d27",]
+cxheatmap(mets, scale = "row", column_split = colData(C13mem_cells)$Celltype, column_labels = colData(C13mem_cells)$Name, rowcex = 0.8, cluster_cols = FALSE,
+          heatpal = heatpal, na_col =  "grey85") |>
+  saveplot(fp(params$figures, "heatmap_metabolites"), dev = "png", width =  2500, height =  2500)
+
+isos <- assay(C13mem_cells, "mid", type = "iso")
+isos <- isos[rowSums(naf(isos > 0.1)) > 2 & naf(rowSds(as.matrix(isos)) > 0),]
+cxheatmap(isos, title = "MID", scale = "", column_split = colData(C13mem_cells)$Celltype, column_labels = colData(C13mem_cells)$Name, rowcex = 0.7,
+          cluster_cols = FALSE,
+          heatpal = circlize::colorRamp2(c(0, 1), c("grey99", "red")), na_col =  "grey85") |>
+  saveplot(fp(params$figures, "heatmap_isotopologues"), dev = "png", width =  2500, height =  3000)
+
+```
+
+
+Fractional enrichment
+```{r}
+
+A <- C13mem@results$met$frac_clean$beta$TSCMvsTN_cells |>
+  volcano(title = "TSCMvsTN", x = diff, xlim = c(-1,1), ylim = c(0,14),
+          lwd = lwd, nlabels = nlabels, lab_size = lab_size, clip = FALSE,
+          max_overlaps = max_overlaps, repel = r, attract = a, point_size = point_size,
+          title_size = panel_title_size, axis_size = axis_lab_size, axis_title_size = axis_title_size, box.padding = b, leg_size = NA)
+
+B <- C13mem@results$met$frac_clean$beta$TCMvsTSCM_cells |>
+  volcano(title = "TCMvsTSCM", x = diff, xlim = c(-1,1), ylim = c(0,14),
+          lwd = lwd, nlabels = nlabels, lab_size = lab_size, clip = FALSE,
+          max_overlaps = max_overlaps, repel = r, attract = a, point_size = point_size,
+          title_size = panel_title_size, axis_size = axis_lab_size, axis_title_size = axis_title_size, box.padding = b, leg_size = NA)
+
+C <- C13mem@results$met$frac_clean$beta$TEMvsTCM_cells |>
+  volcano(title = "TEMvsTCM", x = diff, xlim = c(-1,1), ylim = c(0,14),
+          lwd = lwd, nlabels = nlabels, lab_size = lab_size, clip = FALSE,
+          max_overlaps = max_overlaps, repel = r, attract = a, point_size = point_size,
+          title_size = panel_title_size, axis_size = axis_lab_size, axis_title_size = axis_title_size, box.padding = b, leg_size = NA)
+
+```
+```{r}
+
+p1 <- list(A, B, C)
+Fig1 <-  (wrap_plots(p1, guides = "collect", tag_level = "new", ncol = 1) +
+            plot_annotation(tag_levels = 'A',  theme = theme(plot.tag = element_text(size = 8)))) & theme_fig
+Fig1 |> saveplot(fp(params$figures, "Volcano_FracEnrich"), dev = "png", width =  full_width, height =  full_height*0.8)
+
+```
+
+
+Isotopologue abundances
+```{r}
+
+A <- C13mem@results$iso$clean$lmm$TSCMvsTN_cells |>
+  volcano(title = "TSCMvsTN", xlim = c(-15,15), ylim = c(0,14),
+          lwd = lwd, nlabels = nlabels, lab_size = lab_size, clip = FALSE,
+          max_overlaps = max_overlaps, repel = r, attract = a, point_size = point_size,
+          title_size = panel_title_size, axis_size = axis_lab_size, axis_title_size = axis_title_size, box.padding = b, leg_size = NA) + xlab("log2FC")
+
+B <- C13mem@results$iso$clean$lmm$TCMvsTSCM_cells |>
+  volcano(title = "TCMvsTSCM", xlim = c(-15,15), ylim = c(0,14),
+          lwd = lwd, nlabels = nlabels, lab_size = lab_size, clip = FALSE,
+          max_overlaps = max_overlaps, repel = r, attract = a, point_size = point_size,
+          title_size = panel_title_size, axis_size = axis_lab_size, axis_title_size = axis_title_size, box.padding = b, leg_size = NA) + xlab("log2FC")
+
+C <- C13mem@results$iso$clean$lmm$TEMvsTCM_cells |>
+  volcano(title = "TEMvsTCM", xlim = c(-15,15), ylim = c(0,14),
+          lwd = lwd, nlabels = nlabels, lab_size = lab_size, clip = FALSE,
+          max_overlaps = max_overlaps, repel = r, attract = a, point_size = point_size,
+          title_size = panel_title_size, axis_size = axis_lab_size, axis_title_size = axis_title_size, box.padding = b, leg_size = NA) + xlab("log2FC")
+
+```
+```{r}
+
+p2 <- list(A, B, C)
+Fig2 <-  (wrap_plots(p2, guides = "collect", tag_level = "new", ncol = 1) +
+            plot_annotation(tag_levels = 'A',  theme = theme(plot.tag = element_text(size = 8)))) & theme_fig
+Fig2 |> saveplot(fp(params$figures, "Volcano_IsoAbundance"), dev = "png", width =  full_width, height =  full_height*0.8)
+
+```
+
+```{r}
+
+Fig <-  (wrap_plots(c(p1, p2), guides = "collect", byrow = FALSE, tag_level = "new", ncol = 2) +
+            plot_annotation(tag_levels = 'A',  theme = theme(plot.tag = element_text(size = 8)))) & theme_fig
+Fig |> saveplot(fp(params$figures, "Volcano_combined"), dev = "png", width =  full_width, height =  full_height*0.8)
+Fig |> saveplot(fp(params$figures, "Volcano_combined"), dev = "pdf", width =  full_width, height =  full_height*0.8)
+
+```
+
+
+Medium changes and import/export
+```{r}
+C13medium_cells <- subset(C13mem, Sampletype == "medium" & Batch %in% c("B", "C") & Tracer == "13C" & !is.na(Celltype))
+C13medium_nocells <- subset(C13mem, Sampletype == "medium" & Batch %in% c("B", "C") & Tracer == "13C" & is.na(Celltype))
+```
+
+
+
+Calculate absolute concentrations
+```{r}
+rpmi <- read.xlsx("./data/medium_composition_RPMI.xlsx")
+C13medium <- subset(C13mem, Sampletype == "medium" & Batch %in% c("B", "C") & Tracer == "13C")
+metData(C13medium) <- data.frame(metData(C13medium), rpmi[match(metData(C13medium)$ID, rpmi$target_id),])
+
+C13medium <- get_abs_conc(C13medium)
+C13medium <- get_exchanges(C13medium, assay = "clean", type = "iso", assay.new = "exc.iso")
+C13medium <- get_exchanges(C13medium, assay = "norm", type = "met", assay.new = "exc.met")
+C13medium <- get_exchanges(C13medium, assay = "conc", type = "iso", assay.new = "exc.iso.abs")
+C13medium <- get_exchanges(C13medium, assay = "conc", type = "met", assay.new = "exc.met.abs")
+
+```
+
+
+Exchange plots
+```{r}
+C13exc <- subset(C13medium, Batch %in% c("B", "C") & Tracer == "13C" & !is.na(Celltype))
+
+# Relative
+exc <- C13exc |> assay("exc.met", type = "met") |> get_top_mets(n = 40)
+summarise_cols(exc, colData(C13exc), by = Celltype, FUN = rowMeans) |> t() |>
+  cxheatmap(title = "exchange (AU/24h/mio)", cluster_rows = FALSE,rowcex = 2,colcex = 1.5,) |>
+  saveplot(fp(params$figures, "exchanges_met"), dev = "png", width =  full_width, height =  1500)
+
+isoexc <- C13exc |> assay("exc.iso", type = "iso") |> subsetMet(met = rownames(exc), isodata = isoData(C13exc)) |> get_top_mets(n = 50)
+summarise_cols(isoexc, colData(C13exc), by = Celltype, FUN = rowMeans) |> t() |>
+  cxheatmap(title = "exchange (AU/24h/mio)", cluster_rows = FALSE,rowcex = 2,colcex = 1.5,) |>
+  saveplot(fp(params$figures, "exchanges_iso"), dev = "png", width =  full_width, height =  1500)
+
+
+# Absolute
+exc <- C13exc |> assay("exc.met.abs", type = "met") |> get_top_mets()
+summarise_cols(exc, colData(C13exc), by = Celltype, FUN = rowMeans) |> t() |>
+  cxheatmap(title = "exchange (mM/24h/mio)", cluster_rows = FALSE,rowcex = 2,colcex = 1.5,
+            heatpal = circlize::colorRamp2(c(-3, -0.5, 0, 0.5), c("darkblue", "dodgerblue", "grey99", "red"))) |>
+  saveplot(fp(params$figures, "exchanges_abs_met"), dev = "png", width =  full_width, height =  1500)
+
+isoexc <- C13exc |> assay("exc.iso.abs", type = "iso") |> subsetMet(met = rownames(exc), isodata = isoData(C13exc)) |> get_top_mets(n = 30)
+summarise_cols(isoexc, colData(C13exc), by = Celltype, FUN = rowMeans) |> t() |>
+  cxheatmap(title = "exchange (AU/24h/mio)", cluster_rows = FALSE,rowcex = 2,colcex = 1.5,
+            heatpal = circlize::colorRamp2(c(-3, -0.5, 0, 0.5), c("darkblue", "dodgerblue", "grey99", "red"))) |>
+  saveplot(fp(params$figures, "exchanges_abs_iso"), dev = "png", width =  full_width, height =  1500)
+
+```
+
+
+Ratios
+```{r}
+mid_mean <- C13mem@isoAssays$mid_clean |> summarise_cols(coldata = colData(C13mem), by = Celltype, FUN = rowMeans)
+mid_pro <- mid_mean |> subsetMet(met = "pro", isodata = isoData(C13mem))
+mid_glu <- mid_mean |> subsetMet(met = "glu", isodata = isoData(C13mem))
+mid_pro[3,]/mid_glu[3,]
+
+frac_mean <- C13mem@metAssays$frac |> summarise_cols(coldata = colData(C13mem), by = Celltype, FUN = rowMeans)
+frac_mean["pro",]/frac_mean["glu",]
+
+```
+
+
