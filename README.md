@@ -5,5 +5,5 @@ Additional analyses performed for my PhD thesis. Analyses for the [main manuscri
 Data from the main manuscript should be downloaded into `../kirchmair_2023/data`.
 
 Additional metabolomics analyses are reported in `Metabolomics.Rmd`.
-Additional metabolomics analyses are reported in `Transcriptomics.Rmd`.
+Additional transcriptomics analyses are reported in `Transcriptomics.Rmd`.
 

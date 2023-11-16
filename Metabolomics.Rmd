@@ -4,6 +4,7 @@ author: "Alexander Kirchmair"
 params:
   figures:    ./figures
   data:    ../kirchmair_2023/data
+  tables:   ./tables
 ---
 
 ```{r setup, include=FALSE}
@@ -180,10 +181,9 @@ C13medium_nocells <- subset(C13mem, Sampletype == "medium" & Batch %in% c("B", "
 ```
 
 
-
 Calculate absolute concentrations
 ```{r}
-rpmi <- read.xlsx("./data/medium_composition_RPMI.xlsx")
+rpmi <- read.xlsx(fp(params$tables, "medium_composition_RPMI.xlsx"))
 C13medium <- subset(C13mem, Sampletype == "medium" & Batch %in% c("B", "C") & Tracer == "13C")
 metData(C13medium) <- data.frame(metData(C13medium), rpmi[match(metData(C13medium)$ID, rpmi$target_id),])
 
